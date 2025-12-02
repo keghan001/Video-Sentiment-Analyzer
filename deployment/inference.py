@@ -7,10 +7,66 @@ import subprocess
 import torch
 import whisper
 from transformers import AutoTokenizer
+import sys
+import json
+import tempfile
+import boto3
 
 EMOTION_MAP ={0: 'anger', 1: 'disgust', 2: 'fear', 3: 'joy',
         4: 'neutral', 5: 'sadness', 6: 'surprise'}
 SENTIMENT_MAP = {0: 'negative', 1: 'neutral', 2: 'positive'} 
+
+
+def install_ffmpeg():
+    print("Starting Ffmpeg installation...")
+    
+    subprocess.check_call([sys.executable, "-m", "pip",
+                            "install", "--upgrade", "pip"])
+    
+    subprocess.check_call([sys.executable, "-m", "pip",
+                            "install", "--upgrade", "setuptools"])
+    
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip",
+                                "install", "ffmpeg-python"])
+        print("Ffmpeg-python installed")
+    except subprocess.CalledProcessError as e:
+        print(f"Ffmpeg installation failed {e}")
+        
+    try:
+        subprocess.check_call([
+            "wget",
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz",
+            "-O", "/tmp/ffmpeg.tar.xz"
+        ])
+        
+        subprocess.check_call(
+            ["tar", "-xf", "/tmp/ffmpeg.tar.xz", "-C", "/tmp/"])
+        
+        result = subprocess.run(
+            ["find", "/tmp", "-name", "ffmpeg", "-type", "f"],
+            capture_output=True,
+            text=True
+        )
+        ffmpeg_path = result.stdout.strip()
+        
+        subprocess.check_call(["cp", ffmpeg_path, "/usr/local/bin/ffmpeg"])
+        
+        subprocess.check_call(["chmod", "+x", "/usr/local/bin/ffmpeg"])
+        
+        print("Installed static Ffmpeg binary")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install static FFmpeg {e}")
+    
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=True)
+        print("FFmpeg version:")
+        print(result.stdout)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("FFmpeg installation verification failed")
+        return False
 
 
 class VideoProcessor:
@@ -147,9 +203,36 @@ class VideoUtteranceProcessor:
         
         return segment_path
 
+def download_from_s3(s3_uri):
+    s3_client = boto3.client("s3")
+    bucket = s3_uri.split('/')[2]
+    key = '/'.join(s3_uri.split('/')[3:])
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
+        s3_client.download_file(bucket, key, temp_file.name)
+        return temp_file.name
+    
+def output_fn(prediction, response_content_type):
+    if response_content_type == "application/json":
+        return json.dumps(prediction)
+    return ValueError(f"Unsupported content type: {response_content_type}")
+
+
+def input_fn(request_body, request_content_type):
+    if request_content_type == "application/json":
+        input_data = json.loads(request_body)
+        s3_uri = input_data('video_path')
+        local_path = download_from_s3(s3_uri)
+        return {'video_path': local_path}
+    return ValueError(f"Unsupported content type: {request_content_type}")
+
 def model_fn(model_dir):
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    """Load the model for inference"""
+    if not install_ffmpeg():
+        raise RuntimeError("Ffmpeg not installed --- needed for inference")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
     model = MultimodalSentimentModel()
     
     model_path = Path() / model_dir / "model.pth"
@@ -168,7 +251,7 @@ def model_fn(model_dir):
         "tokenizer": AutoTokenizer.from_pretrained('bert-base-uncased'),
         "transcriber": whisper.load_model(
             "base",
-            device = "cpu",
+            device = device,
         ),
         "device": device
     }
@@ -235,29 +318,29 @@ def predict_fn(input_data, model_dict):
                 
     return predictions
 
-def process_local_video(video_path, model_dir="model_normalized"):
-    model_dict = model_fn(model_dir)
+# def process_local_video(video_path, model_dir="model_normalized"):
+#     model_dict = model_fn(model_dir)
     
-    input_data = {"video_path": video_path}
+#     input_data = {"video_path": video_path}
     
-    predictions = predict_fn(input_data, model_dict)
+#     predictions = predict_fn(input_data, model_dict)
     
-    for utterance in predictions:
-        print("\nUtterance:")
-        print(f"Start: {utterance["start_time"]}s, End{
-            utterance["end_time"]}s")
-        print(f"Text: {utterance["text"]}")
-        print("\nTop Emotions:")
-        for emotion in utterance["emotions"]:
-            print(f"{emotion["label"]}: {emotion["confidence"]:.2f}")
-        print("\nTop Emotions:")
-        for sentiment in utterance["sentiments"]:
-            print(f"{sentiment["label"]}: {sentiment["confidence"]:.2f}")
-        print("--"*50)
+#     for utterance in predictions:
+#         print("\nUtterance:")
+#         print(f"""Start: {utterance["start_time"]}s, End: {
+#             utterance["end_time"]}s""")
+#         print(f"Text: {utterance["text"]}")
+#         print("\nTop Emotions:")
+#         for emotion in utterance["emotions"]:
+#             print(f"{emotion["label"]}: {emotion["confidence"]:.2f}")
+#         print("\nTop Emotions:")
+#         for sentiment in utterance["sentiments"]:
+#             print(f"{sentiment["label"]}: {sentiment["confidence"]:.2f}")
+#         print("--"*50)
 
-def main():
-    process_local_video("joy.mp4")
+# def main():
+#     process_local_video("anger.mp4")
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
     
